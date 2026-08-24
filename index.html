@@ -618,6 +618,8 @@
       <div class="view-head">
         <h2>Centro de Custo</h2>
         <div class="period-row">
+          <label>Visão</label>
+          <div class="company-switch" id="ccViewSwitch" style="margin:0;"></div>
           <label>Referência</label>
           <select class="period-select" id="period-CC" onchange="setCcPeriod(this.value)"></select>
           <label>Comparar com</label>
@@ -625,7 +627,7 @@
         </div>
       </div>
       <div class="company-switch" id="ccSwitch"></div>
-      <div class="hist-note" style="margin-bottom:14px;">Esta visão mostra as <b>saídas (despesas)</b> já classificadas por Centro de Custo diretamente na planilha (coluna "Centro de custo", na aba Saídas). A classificação está sendo concluída unidade por unidade — cada centro aparece aqui assim que for marcado, e os números crescem conforme a planilha for preenchida.</div>
+      <div class="hist-note" style="margin-bottom:14px;" id="ccModeNote"></div>
 
       <div id="ccEmpty" class="hist-note" style="display:none;">Nenhuma unidade tem lançamentos classificados por Centro de Custo ainda.</div>
 
@@ -645,7 +647,7 @@
         </div>
         <div class="card">
           <h3>Despesas por conta — <span id="ccStmtTitle"></span></h3>
-          <div class="desc">Mesma estrutura do Plano de Contas usada na DRE, somando só os lançamentos de Saídas marcados com este Centro de Custo.</div>
+          <div class="desc" id="ccStmtDesc"></div>
           <div class="stmt" id="cc-stmt"></div>
         </div>
       </div>
@@ -701,6 +703,11 @@ let INDICATORS_HIST = {};
 let FRETE_RECORDS = {};
 let CONSOLIDATED = { months: [], dre: {}, dfc: {} };
 let CONSOLIDATED_IND = { months: [], series: {} };
+// Árvore consolidada completa (todos os níveis do plano de contas, até a subcategoria/
+// linha final), somando as 5 unidades. Como as 5 planilhas compartilham o mesmo plano de
+// contas, cada nó casa por código (ou por nome normalizado, no caso das linhas "(=)" de
+// totalização, que reaproveitam o mesmo código em vários pontos da árvore).
+let CONSOLIDATED_TREE = { dre: [], dfc: [] };
 let DATA_LOADED = false;
 let DATA_LOAD_ERROR = null;
 
@@ -711,6 +718,11 @@ let CENTRO_CUSTO_MERGED = {};
 let ccCurrent = null;
 let ccPeriod = {};
 let ccCompare = {};
+// 'dfc' = todas as saídas do centro (visão de caixa). 'dre' = só as saídas que também
+// entram no resultado (exclui transferências entre contas/CNPJs do grupo e pagamento de
+// principal de empréstimo, que são só movimento de caixa) — mesma coluna "Classificação"
+// que já separa DRE de DFC no resto da planilha.
+let ccView = 'dfc';
 const CC_LABELS = {
   'TOCANTINOPOLIS - 64': 'Tocantinópolis (64)',
   'ALTAMIRA - 70': 'Altamira (70)',
@@ -850,6 +862,40 @@ function valByName(key, tipo, nome, month) {
   return (v === undefined) ? null : v;
 }
 
+// Mescla as árvores de DRE/DFC das empresas informadas em uma única árvore, nível por
+// nível, casando os nós por código do plano de contas (ou, para as linhas "(=)" de
+// totalização — que reaproveitam o mesmo código '(=)' em vários pontos — casando pelo
+// nome normalizado). Como as 5 unidades da Clínica Integrar usam o mesmo plano de contas,
+// isso reproduz a árvore completa (todas as subcategorias) já somada entre as unidades.
+function mergeStatementTrees(companies, tipo, months) {
+  function keyOf(n) {
+    if (n.codigo && n.codigo !== '(=)') return 'c:' + n.codigo;
+    return 'n:' + n.nome.replace('(=)', '').trim().toUpperCase();
+  }
+  function mergeLevel(nodeListsPerCompany) {
+    const order = [];
+    const seen = new Set();
+    nodeListsPerCompany.forEach(list => {
+      (list || []).forEach(n => {
+        const k = keyOf(n);
+        if (!seen.has(k)) { seen.add(k); order.push(k); }
+      });
+    });
+    return order.map(k => {
+      const matches = nodeListsPerCompany.map(list => (list || []).find(n => keyOf(n) === k)).filter(Boolean);
+      const ref = matches[0];
+      const valores = {};
+      months.forEach(m => {
+        valores[m] = Math.round(matches.reduce((s, n) => s + ((n.valores && n.valores[m]) || 0), 0) * 100) / 100;
+      });
+      const children = mergeLevel(matches.map(n => n.children || []));
+      return { codigo: ref.codigo, nome: ref.nome, valores, children };
+    });
+  }
+  const rootLists = companies.map(k => ((tipo === 'dre' ? STATEMENTS_HIST[k].dre_skeleton : STATEMENTS_HIST[k].dfc_skeleton) || []));
+  return mergeLevel(rootLists);
+}
+
 function buildConsolidated() {
   const companies = Object.keys(COMPANIES);
   const monthSet = new Set();
@@ -909,6 +955,10 @@ function buildConsolidated() {
   });
 
   CONSOLIDATED = { months, dre, dfc };
+  CONSOLIDATED_TREE = {
+    dre: mergeStatementTrees(companies, 'dre', months),
+    dfc: mergeStatementTrees(companies, 'dfc', months),
+  };
 
   const indSeries = {
     'Margem de Contribuição': {tipo:'brl', valores:{}},
@@ -973,7 +1023,8 @@ function buildCentroCustoMerged(){
   const bestScore = {};
   Object.entries(CENTRO_CUSTO_RAW).forEach(([companyKey, porCentro])=>{
     Object.entries(porCentro || {}).forEach(([centro, info])=>{
-      const score = Object.values(info.porMes || {}).reduce((s,v)=>s+Math.abs(v),0);
+      // pontua sempre pela visão DFC (superconjunto: toda saída é caixa, então dfc >= dre)
+      const score = Object.values((info.porMes && info.porMes.dfc) || {}).reduce((s,v)=>s+Math.abs(v),0);
       if(!(centro in bestScore) || score > bestScore[centro]){
         bestScore[centro] = score;
         merged[centro] = info;
@@ -992,26 +1043,52 @@ function buildCentroCustoMerged(){
 }
 function ccAllMonths(centro){
   const info = CENTRO_CUSTO_MERGED[centro];
-  if(!info) return [];
-  return Object.keys(info.porMes||{}).sort();
+  if(!info || !info.porMes) return [];
+  return Object.keys(info.porMes[ccView] || {}).sort();
 }
 
 function buildCentroCustoSwitch(){
   const el = document.getElementById('ccSwitch');
-  if(!el) return;
-  const keys = Object.keys(CENTRO_CUSTO_MERGED).sort();
-  el.innerHTML = '';
-  keys.forEach(k=>{
-    const b = document.createElement('button');
-    b.className = 'csw-btn';
-    b.textContent = ccLabel(k);
-    b.dataset.scope = k;
-    b.onclick = ()=> setCcCurrent(k);
-    el.appendChild(b);
-  });
+  if(el){
+    const keys = Object.keys(CENTRO_CUSTO_MERGED).sort();
+    el.innerHTML = '';
+    keys.forEach(k=>{
+      const b = document.createElement('button');
+      b.className = 'csw-btn';
+      b.textContent = ccLabel(k);
+      b.dataset.scope = k;
+      b.onclick = ()=> setCcCurrent(k);
+      el.appendChild(b);
+    });
+  }
+  const elView = document.getElementById('ccViewSwitch');
+  if(elView){
+    elView.innerHTML = '';
+    [['dfc','Fluxo de Caixa (DFC)'],['dre','Resultado (DRE)']].forEach(([v,label])=>{
+      const b = document.createElement('button');
+      b.className = 'csw-btn';
+      b.textContent = label;
+      b.dataset.view = v;
+      b.onclick = ()=> setCcView(v);
+      elView.appendChild(b);
+    });
+  }
 }
 function setCcCurrent(k){
   ccCurrent = k;
+  renderCentroCusto();
+}
+function setCcView(v){
+  if(ccView===v) return;
+  ccView = v;
+  // o mês selecionado pode não existir na outra visão (ex.: um centro só tem
+  // lançamento "DFC e DRE" a partir de determinado mês) — recai pro mês mais recente
+  // disponível na visão nova sempre que o valor atual não existir mais nela.
+  Object.keys(CENTRO_CUSTO_MERGED).forEach(k=>{
+    const months = ccAllMonths(k);
+    if(!months.includes(ccPeriod[k])) ccPeriod[k] = months[months.length-1] || '';
+    if(ccCompare[k] && !months.includes(ccCompare[k])) ccCompare[k] = '';
+  });
   renderCentroCusto();
 }
 function setCcPeriod(month){ if(ccCurrent) ccPeriod[ccCurrent] = month; renderCentroCusto(); }
@@ -1033,10 +1110,29 @@ function renderCentroCusto(){
   document.querySelectorAll('#ccSwitch .csw-btn').forEach(b=>{
     b.classList.toggle('active', b.dataset.scope===ccCurrent);
   });
+  document.querySelectorAll('#ccViewSwitch .csw-btn').forEach(b=>{
+    b.classList.toggle('active', b.dataset.view===ccView);
+  });
+
+  const isDre = ccView==='dre';
+  const modeNote = document.getElementById('ccModeNote');
+  if(modeNote){
+    modeNote.innerHTML = isDre
+      ? 'Visão <b>Resultado (DRE)</b>: só as saídas do centro que também entram no resultado — exclui transferências entre contas/CNPJs do grupo e pagamento de principal de empréstimo, que são só movimento de caixa.'
+      : 'Visão <b>Fluxo de Caixa (DFC)</b>: todas as saídas do centro, já classificadas por Centro de Custo diretamente na planilha (coluna "Centro de custo", na aba Saídas). A classificação está sendo concluída unidade por unidade — cada centro aparece aqui assim que for marcado, e os números crescem conforme a planilha for preenchida.';
+  }
+  const stmtDesc = document.getElementById('ccStmtDesc');
+  if(stmtDesc){
+    stmtDesc.textContent = isDre
+      ? 'Mesma estrutura do Plano de Contas usada na DRE, somando só os lançamentos de Saídas deste Centro de Custo classificados como DRE.'
+      : 'Mesma estrutura do Plano de Contas usada na DFC, somando todos os lançamentos de Saídas deste Centro de Custo.';
+  }
 
   const info = CENTRO_CUSTO_MERGED[ccCurrent];
+  const porMes = (info.porMes && info.porMes[ccView]) || {};
+  const tree = (info.tree && info.tree[ccView]) || [];
   const months = ccAllMonths(ccCurrent);
-  if(!ccPeriod[ccCurrent]) ccPeriod[ccCurrent] = months[months.length-1] || '';
+  if(!ccPeriod[ccCurrent] || !months.includes(ccPeriod[ccCurrent])) ccPeriod[ccCurrent] = months[months.length-1] || '';
   const month = ccPeriod[ccCurrent];
   const cmpMonth = ccCompare[ccCurrent];
 
@@ -1048,13 +1144,13 @@ function renderCentroCusto(){
   const titleEl = document.getElementById('ccStmtTitle');
   if(titleEl) titleEl.textContent = ccLabel(ccCurrent);
 
-  const total = (info.porMes && info.porMes[month]) || 0;
-  const totalCmp = cmpMonth ? ((info.porMes && info.porMes[cmpMonth]) || 0) : null;
+  const total = porMes[month] || 0;
+  const totalCmp = cmpMonth ? (porMes[cmpMonth] || 0) : null;
   const kpiEl = document.getElementById('ccKpis');
   if(kpiEl){
     kpiEl.innerHTML = `
       <div class="kpi"><div class="bar" style="background:var(--c-consol)"></div>
-        <div class="lbl">Total de saídas — ${ptMonth(mKeyToShort(month))}</div><div class="val num">${fmtBRL(total)}</div>
+        <div class="lbl">Total de saídas ${isDre?'(Resultado)':'(Fluxo de Caixa)'} — ${ptMonth(mKeyToShort(month))}</div><div class="val num">${fmtBRL(total)}</div>
         ${cmpMonth&&totalCmp!=null?deltaBadge(total, totalCmp, cmpMonth, false):''}</div>
     `;
   }
@@ -1062,8 +1158,8 @@ function renderCentroCusto(){
   const stmtEl = document.getElementById('cc-stmt');
   if(stmtEl){
     stmtUid = 0;
-    const safeKey = 'cc_' + ccCurrent.replace(/[^a-zA-Z0-9]/g,'_');
-    stmtEl.innerHTML = (info.tree||[]).map(n=>renderNode(n,0,'cc',safeKey,month,cmpMonth)).join('') || '<div class="hist-note">Sem lançamentos classificados por plano de contas neste centro de custo.</div>';
+    const safeKey = 'cc_' + ccView + '_' + ccCurrent.replace(/[^a-zA-Z0-9]/g,'_');
+    stmtEl.innerHTML = tree.map(n=>renderNode(n,0,'cc',safeKey,month,cmpMonth)).join('') || '<div class="hist-note">Sem lançamentos classificados por plano de contas neste centro de custo, nesta visão.</div>';
   }
 
   const recent = months.slice(-12);
@@ -1072,7 +1168,7 @@ function renderCentroCusto(){
     if(charts.ccTrend) charts.ccTrend.destroy();
     charts.ccTrend = new Chart(elChart,{
       type:'bar',
-      data:{ labels: recent.map(m=>ptMonth(mKeyToShort(m))), datasets:[{label:'Saídas — '+ccLabel(ccCurrent), data: recent.map(m=>info.porMes[m]||0), backgroundColor:'#B3705B', borderRadius:5}] },
+      data:{ labels: recent.map(m=>ptMonth(mKeyToShort(m))), datasets:[{label:'Saídas — '+ccLabel(ccCurrent), data: recent.map(m=>porMes[m]||0), backgroundColor:'#B3705B', borderRadius:5}] },
       options: baseBarOptions()
     });
   }
@@ -1081,7 +1177,10 @@ function renderCentroCusto(){
   if(elCmp){
     if(charts.ccCompare) charts.ccCompare.destroy();
     const labels = keys.map(ccLabel);
-    const data = keys.map(k=> (CENTRO_CUSTO_MERGED[k].porMes && CENTRO_CUSTO_MERGED[k].porMes[month]) || 0);
+    const data = keys.map(k=> {
+      const pm = CENTRO_CUSTO_MERGED[k].porMes;
+      return (pm && pm[ccView] && pm[ccView][month]) || 0;
+    });
     charts.ccCompare = new Chart(elCmp,{
       type:'bar',
       data:{ labels, datasets:[{label:'Saídas por centro de custo — '+ptMonth(mKeyToShort(month)), data, backgroundColor:'#6E8C7C', borderRadius:5}] },
@@ -2200,77 +2299,26 @@ function renderConsolIndicadores(){
   }).join('');
 }
 
-function renderConsolGroupRow(g, cmpGroup){
-  if(g.tipo){
-    const val = g.tipo==='summary_pct' ? (g.valor==null?'—':(g.valor*100).toFixed(1)+'%') : valCell(g.valor);
-    let cmpCells = '';
-    if(consolCompare && cmpGroup){
-      const cmpVal = cmpGroup.tipo==='summary_pct' ? (cmpGroup.valor==null?'—':(cmpGroup.valor*100).toFixed(1)+'%') : valCell(cmpGroup.valor);
-      let deltaHtml = '<span class="val-delta"></span>';
-      if(g.valor!=null && cmpGroup.valor!=null){
-        const d = g.tipo==='summary_pct' ? (g.valor-cmpGroup.valor)*100 : pctDelta(g.valor, cmpGroup.valor);
-        if(d!=null){ const sign=d>=0?'+':''; deltaHtml = `<span class="val-delta ${d>=0?'pos':'neg'}">${sign}${d.toFixed(1)}${g.tipo==='summary_pct'?'pp':'%'}</span>`; }
-      }
-      cmpCells = `<span class="val-cmp">${cmpVal}</span>${deltaHtml}`;
-    }
-    return `<div class="stmt-row summary" data-name="${(g.nome||'').toLowerCase()}"><span class="name">${g.nome}</span><span class="val">${val}</span>${cmpCells}</div>`;
-  }
-  stmtUid++;
-  const uid = `stc_${stmtUid}`;
-  const hasChildren = g.subgrupos && g.subgrupos.length>0;
-  const caret = hasChildren ? `<span class="caret" id="car_${uid}">▸</span>` : '';
-  let mainCmp = '';
-  if(consolCompare && cmpGroup){
-    let deltaHtml = '<span class="val-delta"></span>';
-    if(g.valor!=null && cmpGroup.valor!=null){
-      const d = pctDelta(g.valor, cmpGroup.valor);
-      if(d!=null){ const sign=d>=0?'+':''; deltaHtml = `<span class="val-delta ${d>=0?'pos':'neg'}">${sign}${d.toFixed(1)}%</span>`; }
-    }
-    mainCmp = `<span class="val-cmp">${valCell(cmpGroup.valor)}</span>${deltaHtml}`;
-  }
-  let html = `
-    <div class="stmt-row depth-0 ${hasChildren?'has-children':'leaf'}" data-name="${g.nome.toLowerCase()}" data-uid="${uid}" ${hasChildren?`onclick="toggleStmt('${uid}')"`:''}>
-      <span class="name">${caret}${g.nome}</span>
-      <span class="val">${valCell(g.valor)}</span>
-      ${mainCmp}
-    </div>
-  `;
-  if(hasChildren){
-    html += `<div class="stmt-children" id="${uid}">`;
-    g.subgrupos.forEach((sg,i)=>{
-      const cmpSg = cmpGroup && cmpGroup.subgrupos ? cmpGroup.subgrupos[i] : null;
-      let sgCmp = '';
-      if(consolCompare && cmpSg){
-        let deltaHtml = '<span class="val-delta"></span>';
-        if(sg.valor!=null && cmpSg.valor!=null){
-          const d = pctDelta(sg.valor, cmpSg.valor);
-          if(d!=null){ const sign=d>=0?'+':''; deltaHtml = `<span class="val-delta ${d>=0?'pos':'neg'}">${sign}${d.toFixed(1)}%</span>`; }
-        }
-        sgCmp = `<span class="val-cmp">${valCell(cmpSg.valor)}</span>${deltaHtml}`;
-      }
-      html += `<div class="stmt-row depth-1 leaf" data-name="${sg.nome.toLowerCase()}"><span class="name">${sg.nome}</span><span class="val">${valCell(sg.valor)}</span>${sgCmp}</div>`;
-    });
-    html += `</div>`;
-  }
-  return html;
-}
-
+// Detalhe do Consolidado usa a MESMA árvore/renderNode das empresas individuais — só que
+// já mesclada (CONSOLIDATED_TREE), então mostra todos os níveis até a subcategoria final,
+// exatamente como em cada CNPJ, com o mesmo comportamento de expandir/buscar.
 function renderConsolStatement(tipo){
   const el = document.getElementById(`stmt-${tipo}-CONSOL`);
   if(!el) return;
   stmtUid = 0;
-  let groups = CONSOLIDATED[tipo][consolPeriod] || [];
+  const month = consolPeriod;
+  const cmpMonth = consolCompare;
+  let tree = CONSOLIDATED_TREE[tipo] || [];
   if(tipo==='dfc'){
-    const idx = groups.findIndex(g => g.tipo && g.nome && g.nome.toUpperCase()==='SALDO INICIAL');
-    if(idx!==-1) groups = groups.slice(0, idx);
+    const idx = tree.findIndex(n => n.nome.replace('(=)','').trim().toUpperCase()==='SALDO INICIAL');
+    if(idx!==-1) tree = tree.slice(0, idx);
   }
-  const cmpGroups = consolCompare ? (CONSOLIDATED[tipo][consolCompare] || []) : null;
-  el.classList.toggle('cmp', !!consolCompare);
+  el.classList.toggle('cmp', !!cmpMonth);
   const cmphead = document.getElementById(`cmphead-${tipo}-CONSOL`);
   if(cmphead){
-    cmphead.innerHTML = consolCompare ? `<div class="stmt-cmp-header"><span>Categoria</span><span>${ptMonth(mKeyToShort(consolPeriod))}</span><span>${ptMonth(mKeyToShort(consolCompare))}</span><span>Δ</span></div>` : '';
+    cmphead.innerHTML = cmpMonth ? `<div class="stmt-cmp-header"><span>Categoria</span><span>${ptMonth(mKeyToShort(month))}</span><span>${ptMonth(mKeyToShort(cmpMonth))}</span><span>Δ</span></div>` : '';
   }
-  el.innerHTML = groups.map((g,i)=>renderConsolGroupRow(g, cmpGroups?cmpGroups[i]:null)).join('');
+  el.innerHTML = tree.map(n=>renderNode(n,0,tipo,'CONSOL',month,cmpMonth)).join('');
   const search = document.getElementById(`search-${tipo}-CONSOL`);
   if(search) search.value = '';
 }
