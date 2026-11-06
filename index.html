@@ -677,6 +677,47 @@
       </div>
       <div class="hist-note">Para o consolidado, esta visão mostra categorias e subcategorias (mesmo nível do restante do dashboard) — o detalhe conta a conta fica disponível ao selecionar uma empresa específica no filtro acima.</div>
     </section>
+
+    <!-- PAGAR E RECEBER -->
+    <section class="view" id="view-PAGAR_RECEBER">
+      <div class="view-head">
+        <h2>Pagar e Receber</h2>
+        <span class="period" id="prUpdatedLabel">Carregando…</span>
+      </div>
+      <div class="company-switch" id="prSwitch"></div>
+      <div class="kpi-row" id="prKpis"></div>
+      <div class="card" style="margin-bottom:16px;">
+        <h3>Saldo bancário e projeção</h3>
+        <div class="desc">Informe o saldo bancário atual (fica salvo só neste navegador) para ver o saldo final previsto considerando o que ainda falta entrar e sair, de acordo com o filtro de empresa acima.</div>
+        <div class="saldos-row" id="prSaldoRow"></div>
+      </div>
+      <div class="card">
+        <h3>Lançamentos</h3>
+        <div class="frete-toolbar" style="margin-bottom:12px;">
+          <input type="text" id="prSearch" placeholder="Buscar por nome, descrição ou NF…" oninput="renderPagarReceberTable()">
+          <select id="prTipo" onchange="renderPagarReceberTable()">
+            <option value="all">Pagar e Receber</option>
+            <option value="Pagar">Só a Pagar</option>
+            <option value="Receber">Só a Receber</option>
+          </select>
+          <select id="prStatus" onchange="renderPagarReceberTable()">
+            <option value="all">Todos os status</option>
+            <option value="Pendente">Pendente</option>
+            <option value="Pago">Pago</option>
+            <option value="Recebido">Recebido</option>
+          </select>
+          <span class="period" id="prCount" style="align-self:center;"></span>
+        </div>
+        <div style="max-height:460px;overflow:auto;">
+          <table class="tbl" id="prTable">
+            <thead><tr><th>Unidade</th><th>Tipo</th><th>Cliente/Fornecedor</th><th>Descrição/Paciente</th><th>NF</th><th class="num">Valor</th><th>Data prevista</th><th>Data realizada</th><th>Status</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="foot-note" id="prErrorNote" style="display:none;"></div>
+      <div class="foot-note">Dados consolidados da planilha "Contas a Pagar" + as 4 planilhas de Recebimentos (Unidades 64, 70, 18 e 19). Atualização automática todo dia às 6h; "Pago"/"Recebido" indica que já existe data de pagamento/recebimento preenchida na planilha de origem.</div>
+    </section>
   </main>
 </div>
 
@@ -696,6 +737,9 @@ const API_URLS = {
   CLI19: "https://script.google.com/macros/s/AKfycbyvNVYDXCjcNqYDchV9rTsuqHc7XXruQyUK6VfwRvSdtf-d3LPjv1bWvg1fdnCmv9IZ6w/exec",
   CLI18: "https://script.google.com/macros/s/AKfycbygnKrMF8ZT9s3IPhlNQNVgh-RNpp9a1-Gz426eBufJ2b6SRY2-FI2ssxuxCh8ocIs7Yg/exec",
 };
+
+// Pagar e Receber — endpoint dedicado (lê o cache consolidado na planilha "Contas a Pagar").
+const PAGAR_RECEBER_API_URL = "https://script.google.com/macros/s/AKfycbwMoM1vb4NblkqnTE_Uiaw7Dv6lbHGaVGLU9OjE17As8eWNVOVvjBXM-O8-S3aQVLdMUg/exec";
 
 let DATA = {};
 let STATEMENTS_HIST = {};
@@ -718,6 +762,14 @@ let CENTRO_CUSTO_MERGED = {};
 let ccCurrent = null;
 let ccPeriod = {};
 let ccCompare = {};
+
+// Pagar e Receber: carregado sob demanda (só quando a aba é aberta), cacheado em memória
+// pelo resto da sessão. prScope segue o mesmo padrão 'ALL'/CLIxx usado no Frete.
+let PR_DATA = null;
+let PR_LOADED = false;
+let PR_LOADING = false;
+let PR_ERROR = null;
+let prScope = 'ALL';
 // 'dfc' = todas as saídas do centro (visão de caixa). 'dre' = só as saídas que também
 // entram no resultado (exclui transferências entre contas/CNPJs do grupo e pagamento de
 // principal de empréstimo, que são só movimento de caixa) — mesma coluna "Classificação"
@@ -1232,7 +1284,7 @@ const ALL_COMPANIES = {
 let COMPANIES = {};
 
 const PROFILES = {
-  clinica_integrar: {label:'Clínica Integrar', desc:'Acesso às 5 unidades (CNPJs) da Clínica Integrar + consolidado', pwd:'gestao2026', companies:['CONSOL','CLI64','CLI70','CLI85','CLI19','CLI18','CENTRO_CUSTO','HISTORICO']},
+  clinica_integrar: {label:'Clínica Integrar', desc:'Acesso às 5 unidades (CNPJs) da Clínica Integrar + consolidado', pwd:'gestao2026', companies:['CONSOL','PAGAR_RECEBER','CLI64','CLI70','CLI85','CLI19','CLI18','CENTRO_CUSTO','HISTORICO']},
 };
 
 let currentProfile = 'clinica_integrar';
@@ -1301,6 +1353,7 @@ function logout(){
 const TAB_LABELS = {
   CONSOL:'Consolidado', FRETE:'Frete', HISTORICO:'Histórico', CENTRO_CUSTO:'Centro de Custo',
   CLI64:'Unidade 64', CLI70:'Unidade 70', CLI85:'Unidade 85', CLI19:'Unidade 19', CLI18:'Unidade 18',
+  PAGAR_RECEBER:'Pagar e Receber',
 };
 
 function buildTabs(){
@@ -1832,6 +1885,7 @@ function showTab(tabId){
   else if(tabId==='FRETE') renderFrete();
   else if(tabId==='HISTORICO') renderHistorico();
   else if(tabId==='CENTRO_CUSTO') renderCentroCusto();
+  else if(tabId==='PAGAR_RECEBER') renderPagarReceber();
 }
 
 function getHistoricValue(key, month){
@@ -2657,6 +2711,183 @@ function filterStatement(tipo, key){
       }
     }
   });
+}
+
+// ---------- PAGAR E RECEBER ----------
+function prSaldoKey(){ return 'pr_saldo_manual_clinica_integrar'; }
+function getPrSaldoManual(){
+  try{
+    const v = localStorage.getItem(prSaldoKey());
+    return v!==null ? (parseFloat(v)||0) : 0;
+  }catch(e){ return 0; }
+}
+function setPrSaldoManual(v){
+  try{ localStorage.setItem(prSaldoKey(), String(v)); }catch(e){}
+}
+
+async function ensurePagarReceberLoaded(){
+  if(PR_LOADED || PR_LOADING) return;
+  PR_LOADING = true;
+  try{
+    const resp = await fetch(PAGAR_RECEBER_API_URL);
+    const json = await resp.json();
+    if(json && json.error) throw new Error(json.error);
+    PR_DATA = json;
+    PR_LOADED = true;
+    PR_ERROR = null;
+  }catch(e){
+    PR_ERROR = e.message || String(e);
+  }finally{
+    PR_LOADING = false;
+  }
+}
+
+// Converte '64','70','85','18','19' (como vem da planilha) na chave CLIxx usada no resto
+// do dashboard. Retorna null se não casar com nenhuma unidade conhecida (ex.: 'N/D').
+function prUnidadeKey(u){
+  const k = 'CLI' + String(u||'').trim();
+  return ALL_COMPANIES[k] ? k : null;
+}
+function prUnidadeLabel(u){
+  const k = prUnidadeKey(u);
+  return k ? ALL_COMPANIES[k].label : (u || 'N/D');
+}
+
+function buildPrSwitch(){
+  const allowed = Object.keys(COMPANIES);
+  const el = document.getElementById('prSwitch');
+  el.innerHTML = '';
+  const scopes = ['ALL', ...allowed];
+  scopes.forEach(key=>{
+    const b = document.createElement('button');
+    b.className = 'csw-btn';
+    b.textContent = key==='ALL' ? 'Todas as empresas' : COMPANIES[key].label;
+    b.dataset.scope = key;
+    b.onclick = ()=> setPrScope(key);
+    el.appendChild(b);
+  });
+  markPrScopeActive();
+}
+
+function markPrScopeActive(){
+  document.querySelectorAll('#prSwitch .csw-btn').forEach(b=>{
+    const active = b.dataset.scope === prScope;
+    b.classList.toggle('active', active);
+    b.style.background = active ? (prScope==='ALL' ? 'var(--c-consol)' : COMPANIES[prScope].colorHex) : '';
+    b.style.color = active ? '#fff' : '';
+  });
+}
+
+function setPrScope(key){
+  prScope = key;
+  markPrScopeActive();
+  renderPagarReceberBody();
+}
+
+function getPrFilteredRows(){
+  if(!PR_DATA || !PR_DATA.rows) return [];
+  let rows = PR_DATA.rows;
+  if(prScope !== 'ALL'){
+    rows = rows.filter(r => prUnidadeKey(r.unidade) === prScope);
+  }
+  return rows;
+}
+
+async function renderPagarReceber(){
+  if(!PR_LOADED){
+    document.getElementById('prUpdatedLabel').textContent = 'Carregando…';
+    await ensurePagarReceberLoaded();
+  }
+  if(!document.getElementById('prSwitch').childElementCount) buildPrSwitch();
+  renderPagarReceberBody();
+}
+
+function renderPagarReceberBody(){
+  if(PR_ERROR){
+    document.getElementById('prUpdatedLabel').textContent = 'Erro ao carregar';
+    const note = document.getElementById('prErrorNote');
+    note.style.display = 'block';
+    note.textContent = 'Não consegui buscar os dados de Pagar e Receber agora. Tente abrir a aba de novo em alguns segundos. (' + PR_ERROR + ')';
+    document.getElementById('prKpis').innerHTML = '';
+    document.getElementById('prSaldoRow').innerHTML = '';
+    document.querySelector('#prTable tbody').innerHTML = '';
+    document.getElementById('prCount').textContent = '';
+    return;
+  }
+  document.getElementById('prErrorNote').style.display = 'none';
+  document.getElementById('prUpdatedLabel').textContent = (PR_DATA && PR_DATA.gerado_em) ? ('Atualizado em ' + PR_DATA.gerado_em) : '';
+
+  const rows = getPrFilteredRows();
+  const totalReceber = rows.filter(r=> r.tipo==='Receber' && r.status==='Pendente').reduce((s,r)=>s+(r.valor||0),0);
+  const totalPagar = rows.filter(r=> r.tipo==='Pagar' && r.status==='Pendente').reduce((s,r)=>s+(r.valor||0),0);
+  const resultado = totalReceber - totalPagar;
+
+  document.getElementById('prKpis').innerHTML = `
+    <div class="kpi"><div class="bar" style="background:var(--pos)"></div>
+      <div class="lbl">Total a Receber (pendente)</div><div class="val num">${fmtBRL(totalReceber)}</div></div>
+    <div class="kpi"><div class="bar" style="background:var(--neg)"></div>
+      <div class="lbl">Total a Pagar (pendente)</div><div class="val num">${fmtBRL(totalPagar)}</div></div>
+    <div class="kpi"><div class="bar" style="background:var(--c-consol)"></div>
+      <div class="lbl">Resultado Operacional Previsto</div><div class="val num">${fmtBRL(resultado)}</div>
+      <div class="sub ${resultado>=0?'pos':'neg'}">${resultado>=0?'Mais a receber do que a pagar':'Mais a pagar do que a receber'}</div></div>
+    <div class="kpi"><div class="bar" style="background:var(--c-consol)"></div>
+      <div class="lbl">Lançamentos no filtro</div><div class="val num">${fmtNum(rows.length)}</div></div>
+  `;
+
+  const saldoManual = getPrSaldoManual();
+  const saldoFinal = saldoManual + resultado;
+  document.getElementById('prSaldoRow').innerHTML = `
+    <div class="saldo-item">
+      <div class="lbl">Saldo bancário atual (informe manualmente)</div>
+      <input type="number" id="prSaldoInput" value="${saldoManual}" step="0.01"
+        style="padding:9px 12px;border:1px solid var(--line);border-radius:10px;font-size:15px;width:160px;font-family:'DM Sans',sans-serif;color:var(--ink);"
+        onchange="onPrSaldoChange(this.value)">
+    </div>
+    <div class="saldo-item"><div class="lbl">Resultado operacional previsto</div>
+      <div class="val">${fmtBRL(resultado)}</div></div>
+    <div class="saldo-item"><div class="lbl">Saldo final previsto</div>
+      <div class="val" style="font-weight:600;">${fmtBRL(saldoFinal)}</div>
+      <div class="delta ${saldoFinal>=0?'pos':'neg'}">${saldoFinal>=0?'Projeção positiva':'Atenção: projeção negativa'}</div></div>
+  `;
+
+  renderPagarReceberTable();
+}
+
+function onPrSaldoChange(v){
+  setPrSaldoManual(parseFloat(v) || 0);
+  renderPagarReceberBody();
+}
+
+function renderPagarReceberTable(){
+  const rows = getPrFilteredRows();
+  const term = (document.getElementById('prSearch').value||'').trim().toLowerCase();
+  const tipo = document.getElementById('prTipo').value;
+  const status = document.getElementById('prStatus').value;
+  let filtered = rows;
+  if(tipo!=='all') filtered = filtered.filter(r=> r.tipo===tipo);
+  if(status!=='all') filtered = filtered.filter(r=> r.status===status);
+  if(term){
+    filtered = filtered.filter(r=>
+      String(r.nome||'').toLowerCase().includes(term) ||
+      String(r.descricao||'').toLowerCase().includes(term) ||
+      String(r.nf||'').toLowerCase().includes(term)
+    );
+  }
+  filtered = filtered.slice().sort((a,b)=> String(b.data_prevista||'').localeCompare(String(a.data_prevista||'')));
+  document.getElementById('prCount').textContent = fmtNum(filtered.length) + ' lançamento(s)';
+  document.querySelector('#prTable tbody').innerHTML = filtered.map(r=>`
+    <tr>
+      <td>${prUnidadeLabel(r.unidade)}</td>
+      <td>${r.tipo||''}</td>
+      <td>${r.nome||''}</td>
+      <td>${r.descricao||''}</td>
+      <td>${r.nf||''}</td>
+      <td class="num">${fmtBRL(r.valor||0)}</td>
+      <td>${r.data_prevista||''}</td>
+      <td>${r.data_realizada||''}</td>
+      <td><span class="pill ${r.status==='Pendente'?'neg':'pos'}">${r.status||''}</span></td>
+    </tr>
+  `).join('');
 }
 
 </script>
