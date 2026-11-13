@@ -319,6 +319,7 @@
   .stmt-row.depth-1:not(.has-children){cursor:default;font-weight:400;background:none;padding-left:28px;color:var(--ink);}
   .stmt-row.leaf{cursor:default;}
   .stmt-row.summary{font-weight:700;background:var(--c-consol);color:#fff;border-radius:8px;margin:6px 0;}
+  .stmt-row.summary.has-children{cursor:pointer;}
   .stmt-row.summary .val{color:#fff;}
   .stmt-children{display:none;}
   .stmt-children.open{display:block;}
@@ -842,10 +843,47 @@ function findNodeByName(tree, nomeUpper) {
   return null;
 }
 
+// Alguns grupos do DFC ("6 Receitas/Despesas Não Operacionais", "7 Investimentos",
+// "8 Financeiro") não têm uma linha de cabeçalho própria no Plano de Contas — só a
+// linha "(=)" do total seguida das subcategorias soltas, no mesmo nível (sem pai).
+// Isso fazia essas subcategorias aparecerem sempre abertas, sem como recolher.
+// Aqui agrupamos essas sequências soltas como filhas do "(=)" que as antecede, só
+// para fins de exibição/recolhimento — não altera nenhum valor calculado.
+function groupOrphanStatementSections(tree) {
+  if (!tree || !tree.length) return tree;
+  for (let i = 0; i < tree.length; i++) {
+    const node = tree[i];
+    if (node.children && node.children.length) continue;
+    if (node.codigo !== '(=)') continue;
+    let j = i + 1;
+    let majorNum = null;
+    const run = [];
+    while (j < tree.length) {
+      const sib = tree[j];
+      const m = /^(\d+)\./.exec(sib.codigo || '');
+      if (!m) break;
+      if (majorNum === null) majorNum = m[1];
+      else if (m[1] !== majorNum) break;
+      run.push(sib);
+      j++;
+    }
+    if (run.length) {
+      const hasExplicitParent = tree.some(n => n.codigo === majorNum);
+      if (!hasExplicitParent) {
+        node.children = run;
+        tree.splice(i + 1, run.length);
+      }
+    }
+  }
+  return tree;
+}
+
 function buildDataForCompany(key, resp) {
   const months = resp.dre.months || [];
   const dreTree = resp.dre.tree || [];
   const dfcTree = (resp.dfc && resp.dfc.tree) || [];
+  groupOrphanStatementSections(dreTree);
+  groupOrphanStatementSections(dfcTree);
 
   STATEMENTS_HIST[key] = {
     dre_months: months,
@@ -2622,7 +2660,7 @@ function renderNode(node, depth, tipo, key, month, cmpMonth){
   stmtUid++;
   const uid = `st_${tipo}_${key}_${stmtUid}`;
   const hasChildren = node.children && node.children.length>0;
-  const isSummary = node.codigo === '(=)' && !hasChildren;
+  const isSummary = node.codigo === '(=)';
   const depthClass = isSummary ? 'summary' : `depth-${Math.min(depth,2)}`;
   const clickable = hasChildren;
   const caret = hasChildren ? `<span class="caret" id="car_${uid}">▸</span>` : '';
